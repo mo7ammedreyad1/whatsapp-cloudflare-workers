@@ -1,68 +1,108 @@
-import { join } from 'path'
+import { KVNamespace } from '@cloudflare/workers-types'
 import { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from '../Types'
 import { initAuthCreds } from './auth-utils'
 import { BufferJSON } from './generics'
-import { KVNamespace } from '@cloudflare/workers-types' 
-import { credsJsonStatus, logForDevelopment } from '..'
 
-export const useMultiFileAuthState = async(folder: string, KVStorage: KVNamespace): Promise<{ state: AuthenticationState, saveCreds: () => Promise<void> }> => { 
-	
-	const fixFileName = (file?: string) => file?.replace(/\//g, '__')?.replace(/:/g, '-')
+/**
+ * نسخة معدلة لتعمل مع Cloudflare KV بدلاً من R2
+ */
+export const useMultiFileAuthState = async (
+    folder: string, 
+    kv: KVNamespace
+): Promise<{ state: AuthenticationState, saveCreds: () => Promise<void> }> => {
 
-	const writeData = async (data: any, file: string) => {
-		const filePath = join(folder, fixFileName(file)!)
-		const dataFormatted = JSON.stringify(data, BufferJSON.replacer)
-		
-		if (logForDevelopment.show) console.log('KV Write:', filePath)
+    // دالة مساعدة لدمج المسارات بدون الحاجة لمكتبة 'path'
+    const safeJoin = (f: string, filename: string) => `${f}/${filename.replace(/\//g, '__').replace(/:/g, '-')}`;
 
-		// في KV بنستخدم put مباشرة وبنخزن الميتا داتا كـ JSON لو احتجنا
-		// الـ KV لا يدعم customMetadata بنفس طريقة R2، هنخزن البيانات بس
-		await KVStorage.put(filePath, dataFormatted)
-		
-		credsJsonStatus.update = true
-	}
+    // 1. دالة الكتابة في الـ KV
+    const writeData = async (data: any, file: string) => {
+        const filePath = safeJoin(folder, file);
+        try {
+            console.log(`[KV Write] Attempting to write: ${filePath}`);
+            const dataFormatted = JSON.stringify(data, BufferJSON.replacer);
+            
+            // في KV نستخدم put مباشرة
+            await kv.put(filePath, dataFormatted);
+            
+            console.log(`[KV Write] Successfully saved: ${filePath}`);
+        } catch (error: any) {
+            console.error(`[KV Write ERROR] Failed to write ${filePath}:`, error.message);
+            throw error;
+        }
+    }
 
-	const readData = async(file: string) => {
-		try {
-			const filePath = join(folder, fixFileName(file)!)
-			if (logForDevelopment.show) console.log('KV Read:', filePath)
+    // 2. دالة القراءة من الـ KV
+    const readData = async (file: string) => {
+        const filePath = safeJoin(folder, file);
+        try {
+            console.log(`[KV Read] Reading: ${filePath}`);
+            const data = await kv.get(filePath);
 
-			const data = await KVStorage.get(filePath)
-			if (!data) return null
+            if (!data) {
+                console.log(`[KV Read] No data found for: ${filePath}`);
+                return null;
+            }
 
-			return JSON.parse(data, BufferJSON.reviver)
-		} catch(error) {
-			return null
-		}
-	}
+            const parsedData = JSON.parse(data, BufferJSON.reviver);
+            console.log(`[KV Read] Success: ${filePath}`);
+            return parsedData;
+        } catch (error: any) {
+            console.error(`[KV Read ERROR] Failed to read ${filePath}:`, error.message);
+            return null;
+        }
+    }
 
-	const removeData = async(file: string) => {
-		try {
-			const filePath = join(folder, fixFileName(file)!)
-			await KVStorage.delete(filePath)
-		} catch {}
-	}
+    // 3. دالة الحذف من الـ KV
+    const removeData = async (file: string) => {
+        const filePath = safeJoin(folder, file);
+        try {
+            console.log(`[KV Delete] Removing: ${filePath}`);
+            await kv.delete(filePath);
+        } catch (error: any) {
+            console.error(`[KV Delete ERROR] Failed to delete ${filePath}:`, error.message);
+        }
+    }
 
-	const creds: AuthenticationCreds = await readData('creds.json') || initAuthCreds()
+    // تهيئة البيانات الأساسية (creds.json)
+    console.log("[Auth Init] Checking for existing credentials...");
+    const creds: AuthenticationCreds = await readData('creds.json') || initAuthCreds();
 
-	return {
-		state: {
-			creds,
-			keys: {
-				get: async(type, ids) => {
-					const data: { [_: string]: SignalDataTypeMap[typeof type] } = { }
-					ids.map(id => {
-						data[id] = null as any
-					})
-					return data
-				},
-				set: async(data) => {
-					return void 0 
-				}
-			}
-		},
-		saveCreds: async () => { 
-			return await writeData(creds, 'creds.json') 
-		}
-	}
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    console.log(`[Keys Get] Fetching keys for type: ${type}`);
+                    const data: { [_: string]: SignalDataTypeMap[typeof type] } = {};
+                    
+                    await Promise.all(
+                        ids.map(async (id) => {
+                            let value = await readData(`${type}-${id}.json`);
+                            if (type === 'app-state-sync-key' && value) {
+                                // هنا يمكن إضافة تحويل البروتوكول إذا كان مطلوباً
+                            }
+                            data[id] = value;
+                        })
+                    );
+                    return data;
+                },
+                set: async (data) => {
+                    console.log(`[Keys Set] Saving keys...`);
+                    const tasks: Promise<void>[] = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const file = `${category}-${id}.json`;
+                            tasks.push(value ? writeData(value, file) : removeData(file));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: async () => {
+            console.log("[Auth] Saving core credentials...");
+            return await writeData(creds, 'creds.json');
+        }
+    }
 }
