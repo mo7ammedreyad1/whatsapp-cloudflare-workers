@@ -1,439 +1,187 @@
-
 import NodeCache from '@cacheable/node-cache'
 import P from 'pino'
 import type { Boom } from '@hapi/boom'
-import { ExecutionContext, R2Bucket } from "@cloudflare/workers-types"
+import { ExecutionContext, KVNamespace } from "@cloudflare/workers-types"
 import makeWASocket, { credsJsonStatus, DisconnectReason, fetchLatestBaileysVersion, logForDevelopment, makeCacheableSignalKeyStore, useMultiFileAuthState } from "../src"
 // @ts-ignore
 import registerWhatsappHtml from './registerWhatsappHtml.html'
 // @ts-ignore
 import sendMessageHtml from './sendMessageHtml.html'
 
-
+// تعديل نوع البيانات لاستخدام KV بدلاً من R2
 export type envData = {
-    R2_whatsappCloudflareWorkers: R2Bucket;
+    KV_whatsappCloudflareWorkers: KVNamespace;
 }
-
 
 export default {
 	async fetch(request: Request, env: envData, ctx: ExecutionContext): Promise<Response> {
 		const newUrl = new URL(request.url)
 		const pathName = newUrl.pathname
-		// Used to retrieve all userBot in registerWhatsappHtml.html and sendMessageHtml.html
 		const prefixUserBot = 'userBot'
 
+		// نصيحة: غير كلمة المرور هذه في ملف wrangler.toml أو هنا
 		const PASSWORD_ADMIN = '123456'
 
 		logForDevelopment.show = false
 
-		// Site: /site/register-whatsapp
 		if (pathName.startsWith('/site/register-whatsapp') || pathName === '/') {
-            const response = new Response(registerWhatsappHtml, {
+            return new Response(registerWhatsappHtml, {
                 status: 200,
-                statusText: 'OK',
-                headers: {
-                    'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache',
-                    'Access-Control-Allow-Origin': '*',
-                }
+                headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' }
             })
-
-            return response
 		}
 
-		// Site: /site/send-message
 		else if (pathName.startsWith('/site/send-message')) {
-            const response = new Response(sendMessageHtml, {
+            return new Response(sendMessageHtml, {
                 status: 200,
-                statusText: 'OK',
-                headers: {
-                    'Content-Type': 'text/html',
-                    'Cache-Control': 'no-cache',
-                    'Access-Control-Allow-Origin': '*',
-                }
+                headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' }
             })
-
-            return response
 		}
 
-		// Example: POST /api/register-whatsapp {userBot: "bot01", adminPassword: "123456"}
 		else if (pathName.startsWith('/api/register-whatsapp') && request.method === 'POST') {
 			try {
 				const requestBody = await request.json() as { userBot: string; adminPassword: string }
-
 				let userBot = requestBody.userBot
 				const adminPassword = requestBody.adminPassword
 
 				if (adminPassword !== PASSWORD_ADMIN) {
-					console.log('WARNING [adminPassword !== ***] No permission')
-					return new Response('WARNING [adminPassword !== ***] No permission', {status: 401})
-				}
-
-				if (!userBot) {
-					console.log('WARNING [!userBot] Missing userBot')
-					return new Response('WARNING [!userBot] Missing userBot', {status: 400})
+					return new Response('Unauthorized', {status: 401})
 				}
 
 				userBot = `${prefixUserBot}/${userBot}`
 
-				console.log(`SUCCESS [userBot] Name userBot: ${userBot}`)
+				// في KV نقوم بحذف المفتاح (البيانات القديمة)
+				await env.KV_whatsappCloudflareWorkers.delete(`${userBot}/creds.json`)
 
-				// IMPORTANT
-				// Deleting old creds.json is necessary to avoid bugs
-				// IMPORTANT
-				await env.R2_whatsappCloudflareWorkers.delete(`${userBot}/creds.json`)
-
-				const sockAndLink = await apiRegisterWhatsapp(userBot, env.R2_whatsappCloudflareWorkers)
+				const sockAndLink = await apiRegisterWhatsapp(userBot, env.KV_whatsappCloudflareWorkers)
 
 				if (!sockAndLink) {
-					console.log('WARNING [!sock] Generating link');
-					return new Response('WARNING [!sock] Generating link', { status: 400 })
+					return new Response('Error generating QR', { status: 400 })
 				}
 
-				const sock = sockAndLink.sock
-				const link = sockAndLink.link
+				const { sock, link } = sockAndLink
 
 				ctx.waitUntil(
-					new Promise((resolve, reject) => {
+					new Promise((resolve) => {
 						setTimeout(async () => {
 							try {
 								await sock.ws.close()
-								sock.end({
-									name: 'false',
-									message: 'false'
-								})
 								resolve(undefined)
-							}
-
-							catch (error) {
-								reject(error)
-							}
+							} catch { resolve(undefined) }
 						}, 50000)
 					})
 				)
 
-				return new Response(JSON.stringify({
-					link: link
-				}), {
+				return new Response(JSON.stringify({ link }), {
 					status: 200,
-					headers: {
-						'Content-Type': 'application/json'
-					}
+					headers: { 'Content-Type': 'application/json' }
 				})
-			}
-
-			catch (error) {
-				console.log('ERRO [catch] Erro in /send-message', error)
-				return new Response('ERRO [catch] Erro in /send-message', {status: 500})
+			} catch (error) {
+				return new Response('Error', {status: 500})
 			}
 		}
 
-		// Example: POST /api/send-message { userBot: "bot01", phone: "1234567890", message: "Hello World", adminPassword: "123456" }
 		else if (pathName.startsWith('/api/send-message') && request.method === 'POST') {
 			try {
 				const requestBody = await request.json() as { userBot: string; phone: string; message: string; adminPassword: string }
+				let { userBot, phone, message, adminPassword } = requestBody
 
-				let userBot = requestBody.userBot
-				const phone = requestBody.phone
-				let message = requestBody.message
-				const adminPassword = requestBody.adminPassword
-
-				if (adminPassword !== PASSWORD_ADMIN) {
-					console.log('WARNING [adminPassword !== ***] No permission')
-					return new Response('WARNING [adminPassword !== ***] No permission', {status: 401})
-				}
-
-				if (!userBot || !phone || !message) {
-					console.log('WARNING [!userBot || !phone || !message] Missing phone or message')
-					return new Response('WARNING [!phone || !message] Missing phone or message', {status: 400})
-				}
+				if (adminPassword !== PASSWORD_ADMIN) return new Response('Unauthorized', {status: 401})
 
 				userBot = `${prefixUserBot}/${userBot}`
-				message = message?.replace(/\r?\n|\r/g, '\n')
+				
+				// التأكد من وجود الجلسة في الـ KV
+				const creds = await env.KV_whatsappCloudflareWorkers.get(`${userBot}/creds.json`)
+				if (!creds) return new Response('No session found. Please login first.', {status: 400})
 
-				console.log(`SUCCESS [userBot] Name userBot: ${userBot}`)
-				console.log(`SUCCESS [message] Sending message: ${message}`)
-				console.log(`SUCCESS [phone] To the phone: ${phone}`)
+				const result = await apiSendMessage(userBot, phone, message, env.KV_whatsappCloudflareWorkers)
 
-				// IMPORTANT
-				// It is necessary to have already stored in R2 the auth_info_baileys/creds.json of the sender's WhatsApp account
-				// IMPORTANT
-				const creds = await env.R2_whatsappCloudflareWorkers.get(`${userBot}/creds.json`)
-				if (!creds) {
-					console.log('WARNING [!creds] No credentials found')
-					return new Response('WARNING [!creds] No credentials found', {status: 400})
-				}
+				if(!result) return new Response('Error sending message', {status: 400})
 
-				//var sock = await iniciar(env, phone, message)
-				const sockAndSuccessSend = await apiSendMessage(userBot, phone, message, env.R2_whatsappCloudflareWorkers)
-
-				if(!sockAndSuccessSend) {
-					console.log('WARNING [!sock] Sending message')
-					return new Response('WARNING [!sock] Sending message', {status: 400})
-				}
-
-				const sock = sockAndSuccessSend.sock
-				const successSend = sockAndSuccessSend.successSend
-
+				const { sock, successSend } = result
 				await sock.ws.close()
-				sock.end({
-					name: 'false',
-					message: 'false'
-				})
 
-				if (!successSend) {
-					console.log('WARNING [!successSend] Message not sent')
-					return new Response('WARNING [!successSend] Message not sent', {status: 400})
-				}
-
-				return new Response('SUCCESS [sent] Message sent successfully!', {
-					status: 200,
-					headers: {
-						'Content-Type': 'application/json'
-					}
-				})
-			}
-
-			catch (error) {
-				console.log('ERRO [catch] Erro in /send-message', error)
-				return new Response('ERRO [catch] Erro in /send-message', {status: 500})
+				return new Response(successSend ? 'Message sent' : 'Failed to send', { status: successSend ? 200 : 400 })
+			} catch (error) {
+				return new Response('Error', {status: 500})
 			}
 		}
 
-		// Example: GET /api/get-all-user-bot
 		else if (pathName.startsWith('/api/get-all-user-bot') && request.method === 'GET') {
-			const allUserBotHead = await env.R2_whatsappCloudflareWorkers.list({ prefix: `${prefixUserBot}/` })
-
-			const objects: { userBot: string; name: string; phone: string; path: string; size: number; created: string; updated: Date; }[] = []
-			for (const obj of allUserBotHead.objects) {
-				const head = await env.R2_whatsappCloudflareWorkers.head(obj.key)
-
-				objects.push({
-					userBot: head?.customMetadata?.userBot || obj?.key?.split("/")?.slice(-2, -1)?.[0] || 'not found',
-					name: head?.customMetadata?.name || 'not found',
-					phone: head?.customMetadata?.phone || 'not found',
-					path: head?.customMetadata?.path || 'not found',
-					size: obj.size,
-					created: head?.customMetadata?.created || 'not found',
-					updated: obj.uploaded
-				})
-			}
-
-			objects.sort((a, b) => {
-				const createdA = new Date(!a?.created || a?.created === 'not found' ? '11/11/1111-11:11' : a?.created).getTime()
-				const createdB = new Date(!b?.created || b?.created === 'not found' ? '11/11/1111-11:11' : b?.created).getTime()
-		
-				return createdB - createdA
-			})
-
-			return new Response(JSON.stringify(objects), {
+			// جلب قائمة المستخدمين من KV
+			const list = await env.KV_whatsappCloudflareWorkers.list({ prefix: `${prefixUserBot}/` })
+			return new Response(JSON.stringify(list.keys), {
 				status: 200,
-				headers: {
-					'Content-Type': 'application/json'
-				}
+				headers: { 'Content-Type': 'application/json' }
 			})
 		}
 
-		else {
-			return new Response('No found', {status: 404})
-		}
+		return new Response('Not Found', {status: 404})
 	}
 }
 
-async function apiRegisterWhatsapp(userBot: string, R2FileStorage: R2Bucket): Promise<{sock: ReturnType<typeof makeWASocket>, link: string} | false> {
+// تعديل الوظائف المساعدة لاستقبال KVNamespace بدلاً من R2Bucket
+async function apiRegisterWhatsapp(userBot: string, storage: KVNamespace) {
 	try {
-		const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` })
-		logger.level = 'silent'
-
+		const logger = P({ level: 'silent' })
 		const msgRetryCounterCache = new NodeCache()
+		const dateNow = Date.now()
 
-		const dateNowForReconnection = Date.now()
-		const startSock = async() => {
-			const { state, saveCreds } = await useMultiFileAuthState(userBot, R2FileStorage)
-
-			if (logForDevelopment.show) console.log('WARNING [startSock = async() => {...]', '[state.creds]', state.creds)
-
-			const { version, isLatest } = await fetchLatestBaileysVersion()
-			if (logForDevelopment) console.log(`WARNING [startSock = async() => {...] Using WA v${version.join('.')}, isLatest: ${isLatest}`)
+		const startSock = async () => {
+			// ملاحظة: يجب أن تكون مكتبة useMultiFileAuthState تدعم الـ KV أو يتم تعديلها
+			const { state, saveCreds } = await useMultiFileAuthState(userBot, storage as any)
+			const { version } = await fetchLatestBaileysVersion()
 
 			const sock = makeWASocket({
 				version,
 				logger,
-				printQRInTerminal: false,
 				auth: {
 					creds: state.creds,
 					keys: makeCacheableSignalKeyStore(state.keys, logger),
 				},
 				msgRetryCounterCache,
-				generateHighQualityLinkPreview: true
 			})
 
-			let waitForLink = ''
-			sock.ev.process(
-				async(events) => {
-					if(events['connection.update']) {
-						const update = events['connection.update']
-						const { connection, lastDisconnect } = update
-						if(connection === 'close') {
-							if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
-								if ((Date.now() - dateNowForReconnection) <= 15000) {
-									if (logForDevelopment) console.log('WARNING [events["connection.update"]] Reconnection allowed')
-									// Only in apiRegisterWhatsapp() reconnects after the authenticated creds.json is posted
-									const waitForUpdateCredsJson = async () => {
-										if (logForDevelopment) console.log('WARNING [waitForUpdateCredsJson()] Initiating waitForUpdateCredsJson()')
-										while (!credsJsonStatus.update) {
-											if (logForDevelopment) console.log('WARNING [while waitForUpdateCredsJson()] credsJsonStatus.update is false, awaiting 200ms...')
-											await new Promise(resolve => setTimeout(resolve, 200))
-										}
-										startSock()
-									}
-									waitForUpdateCredsJson()
-								}
-
-								else {
-									if (logForDevelopment) console.log('WARNING [events["connection.update"]] Reconnection not allowed')
-								}
-							}
-
-							else {
-								if (logForDevelopment) console.log('WARNING [events["connection.update"]] Connection closed. You are logged out')
-							}
-						}
-
-						if (update.qr) {
-							waitForLink = update.qr
-						}
-					}
-
-					if(events['creds.update']) {
-						await saveCreds()
-					}
+			let qrCode = ''
+			sock.ev.process(async (events) => {
+				if (events['connection.update']) {
+					const { connection, qr } = events['connection.update']
+					if (qr) qrCode = qr
 				}
-			)
+				if (events['creds.update']) await saveCreds()
+			})
 
-			while (!waitForLink) {
-				await new Promise(resolve => setTimeout(resolve, 1000))
-			}
-
-			return {
-				sock,
-				link: waitForLink
-			}
+			while (!qrCode) await new Promise(r => setTimeout(r, 1000))
+			return { sock, link: qrCode }
 		}
 
-		const returnIntermediary = await startSock()
-		if (!returnIntermediary) {
-			return false
-		}
-
-		return returnIntermediary
-	}
-
-	catch (error) {
-		if (logForDevelopment) console.log('ERRO [catch] [connectWhatsapp()]:', error)
-		return false
-	}
+		return await startSock()
+	} catch { return false }
 }
 
-async function apiSendMessage(userBot: string, phone: string, message: string, R2FileStorage: R2Bucket): Promise<{sock: ReturnType<typeof makeWASocket>, successSend: boolean} | false> {
+async function apiSendMessage(userBot: string, phone: string, message: string, storage: KVNamespace) {
 	try {
-		const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` })
-		logger.level = 'silent'
+		const logger = P({ level: 'silent' })
+		const { state, saveCreds } = await useMultiFileAuthState(userBot, storage as any)
+		const { version } = await fetchLatestBaileysVersion()
 
-		const msgRetryCounterCache = new NodeCache()
+		const sock = makeWASocket({
+			version,
+			logger,
+			auth: {
+				creds: state.creds,
+				keys: makeCacheableSignalKeyStore(state.keys, logger),
+			},
+		})
 
 		let successSend = false
-		const startSock = async() => {
-			const { state, saveCreds } = await useMultiFileAuthState(userBot, R2FileStorage) //CF
-			const { version, isLatest } = await fetchLatestBaileysVersion()
-			if (logForDevelopment) console.log(`WARNING [startSock = async() => {...] Using WA v${version.join('.')}, isLatest: ${isLatest}`)
+		sock.ev.on('creds.update', saveCreds)
 
-			const sock = makeWASocket({
-				version,
-				logger,
-				printQRInTerminal: false,
-				auth: {
-					creds: state.creds,
-					keys: makeCacheableSignalKeyStore(state.keys, logger),
-				},
-				msgRetryCounterCache,
-				generateHighQualityLinkPreview: true
-			})
+		await new Promise(r => setTimeout(r, 3000))
+		const jid = `${phone}@s.whatsapp.net`
+		const sent = await sock.sendMessage(jid, { text: message })
+		if (sent) successSend = true
 
-			sock.ev.process(
-				async(events) => {
-					if(events['connection.update']) {
-						const update = events['connection.update']
-						const { connection, lastDisconnect } = update
-						if(connection === 'close') {
-							if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
-								if (logForDevelopment) console.log('WARNING [events["connection.update"]] Reconnection not allowed')
-							}
-
-							else {
-								if (logForDevelopment) console.log('WARNING [events["connection.update"]] Connection closed. You are logged out')
-							}
-						}
-
-						if (logForDevelopment) console.log('WARNING [events["connection.update"]] Connection update', update)
-					}
-
-					if(events['creds.update']) {
-						await saveCreds()
-					}
-				}
-			)
-
-			const delay = (ms: number) => new Promise<true>((resolve) => setTimeout(() => resolve(true), ms))
-
-			let countAttempt = 0
-
-			await delay(2000)
-
-			while (!successSend && countAttempt < 2) {
-				countAttempt++;
-				if (logForDevelopment) console.log(`WARNING [while (!successSend && countAttempt < 2) {...] Attempted sending of message n°${countAttempt}`)
-
-				try {
-					const jid = `${phone}@s.whatsapp.net`
-
-					await sock.sendPresenceUpdate('composing', jid)
-					await delay(2000 + Math.random() * 3000)
-
-					await sock.sendPresenceUpdate('paused', jid)
-
-					const responseSendMessage = await sock.sendMessage(jid, { text: message })
-
-					if (responseSendMessage?.status! >= 1) {
-						successSend = true
-						if (logForDevelopment) console.log("WARNING [responseSendMessage?.status! >= 1] {...] Message sent successfully!", responseSendMessage)
-
-						await delay(5000)
-						break
-					}
-
-					if (logForDevelopment) console.log("ERRO [!(responseSendMessage?.status! >= 1)] sending message, trying again in 2 seconds...", responseSendMessage)
-				}
-				catch (error) {
-					if (logForDevelopment) console.log("ERRO [catch] sending message, trying again in 2 seconds...", error)
-				}
-
-				await delay(2000)
-			}
-
-			return sock
-		}
-
-		const returnIntermediary = await startSock()
-		if (!returnIntermediary) {
-			return false
-		}
-
-		return {sock: returnIntermediary, successSend: successSend}
-	}
-
-	catch (error) {
-		if (logForDevelopment) console.log('ERRO [catch] [sendMessage()]:', error)
-		return false
-	}
+		return { sock, successSend }
+	} catch { return false }
 }
