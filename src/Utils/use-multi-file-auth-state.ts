@@ -3,68 +3,43 @@ import { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from '../
 import { initAuthCreds } from './auth-utils'
 import { BufferJSON } from './generics'
 
-/**
- * نسخة معدلة لتعمل مع Cloudflare KV بدلاً من R2
- */
-export const useMultiFileAuthState = async (
-    folder: string, 
-    kv: KVNamespace
-): Promise<{ state: AuthenticationState, saveCreds: () => Promise<void> }> => {
+export const useMultiFileAuthState = async (folder: string, kv: KVNamespace): Promise<{ state: AuthenticationState, saveCreds: () => Promise<void> }> => {
+    
+    // دالة دمج المسارات بدون الاعتماد على مكتبة path
+    const fixFileName = (file?: string) => file?.replace(/\//g, '__')?.replace(/:/g, '-');
+    const getPath = (file: string) => `${folder}/${fixFileName(file)}`;
 
-    // دالة مساعدة لدمج المسارات بدون الحاجة لمكتبة 'path'
-    const safeJoin = (f: string, filename: string) => `${f}/${filename.replace(/\//g, '__').replace(/:/g, '-')}`;
-
-    // 1. دالة الكتابة في الـ KV
     const writeData = async (data: any, file: string) => {
-        const filePath = safeJoin(folder, file);
         try {
-            console.log(`[KV Write] Attempting to write: ${filePath}`);
-            const dataFormatted = JSON.stringify(data, BufferJSON.replacer);
-            
-            // في KV نستخدم put مباشرة
-            await kv.put(filePath, dataFormatted);
-            
-            console.log(`[KV Write] Successfully saved: ${filePath}`);
-        } catch (error: any) {
-            console.error(`[KV Write ERROR] Failed to write ${filePath}:`, error.message);
-            throw error;
+            const filePath = getPath(file);
+            const dataString = JSON.stringify(data, BufferJSON.replacer);
+            await kv.put(filePath, dataString);
+        } catch (err) {
+            console.error("KV Write Error:", err);
         }
-    }
+    };
 
-    // 2. دالة القراءة من الـ KV
     const readData = async (file: string) => {
-        const filePath = safeJoin(folder, file);
         try {
-            console.log(`[KV Read] Reading: ${filePath}`);
+            const filePath = getPath(file);
             const data = await kv.get(filePath);
-
-            if (!data) {
-                console.log(`[KV Read] No data found for: ${filePath}`);
-                return null;
-            }
-
-            const parsedData = JSON.parse(data, BufferJSON.reviver);
-            console.log(`[KV Read] Success: ${filePath}`);
-            return parsedData;
-        } catch (error: any) {
-            console.error(`[KV Read ERROR] Failed to read ${filePath}:`, error.message);
+            if (!data) return null;
+            return JSON.parse(data, BufferJSON.reviver);
+        } catch (err) {
+            console.error("KV Read Error:", err);
             return null;
         }
-    }
+    };
 
-    // 3. دالة الحذف من الـ KV
     const removeData = async (file: string) => {
-        const filePath = safeJoin(folder, file);
         try {
-            console.log(`[KV Delete] Removing: ${filePath}`);
-            await kv.delete(filePath);
-        } catch (error: any) {
-            console.error(`[KV Delete ERROR] Failed to delete ${filePath}:`, error.message);
+            await kv.delete(getPath(file));
+        } catch (err) {
+            console.error("KV Delete Error:", err);
         }
-    }
+    };
 
-    // تهيئة البيانات الأساسية (creds.json)
-    console.log("[Auth Init] Checking for existing credentials...");
+    // تحميل بيانات الاعتماد
     const creds: AuthenticationCreds = await readData('creds.json') || initAuthCreds();
 
     return {
@@ -72,14 +47,13 @@ export const useMultiFileAuthState = async (
             creds,
             keys: {
                 get: async (type, ids) => {
-                    console.log(`[Keys Get] Fetching keys for type: ${type}`);
                     const data: { [_: string]: SignalDataTypeMap[typeof type] } = {};
-                    
                     await Promise.all(
-                        ids.map(async (id) => {
+                        ids.map(async id => {
                             let value = await readData(`${type}-${id}.json`);
                             if (type === 'app-state-sync-key' && value) {
-                                // هنا يمكن إضافة تحويل البروتوكول إذا كان مطلوباً
+                                // التوافق مع Baileys
+                                // value = proto.Message.AppStateSyncKeyData.fromObject(value)
                             }
                             data[id] = value;
                         })
@@ -87,7 +61,6 @@ export const useMultiFileAuthState = async (
                     return data;
                 },
                 set: async (data) => {
-                    console.log(`[Keys Set] Saving keys...`);
                     const tasks: Promise<void>[] = [];
                     for (const category in data) {
                         for (const id in data[category]) {
@@ -101,8 +74,7 @@ export const useMultiFileAuthState = async (
             }
         },
         saveCreds: async () => {
-            console.log("[Auth] Saving core credentials...");
-            return await writeData(creds, 'creds.json');
+            await writeData(creds, 'creds.json');
         }
-    }
-}
+    };
+};
